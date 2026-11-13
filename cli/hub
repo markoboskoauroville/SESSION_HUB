@@ -191,8 +191,7 @@ def main():
         if len(rest) < 2:
             sys.exit('usage: hub send <to> "text"')
         i = me()
-        if not os.path.exists(os.path.join(STATE, "self.json")):
-            register(i)
+        register(i)
         code, j = call("POST", "/send", {"from": i["sid"], "to": rest[0], "text": " ".join(rest[1:]), "id": uuid.uuid4().hex})
         if code == 404 and "unknown" in json.dumps(j):
             register(i)
