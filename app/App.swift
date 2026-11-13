@@ -1,7 +1,7 @@
 import SwiftUI
 import AppKit
 
-let VERSION = 1
+let VERSION = 2
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationWillFinishLaunching(_ notification: Notification) {

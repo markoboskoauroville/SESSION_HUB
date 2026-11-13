@@ -177,7 +177,7 @@ struct MainView: View {
                     VStack(alignment: .leading, spacing: 10) {
                         ForEach(thread) { m in
                             VStack(alignment: .leading, spacing: 2) {
-                                Text("\(clock(m.ts))  \(m.fromName) to \(m.toName)  \(m.delivered ? "" : "(queued)")")
+                                Text("\(clock(m.ts))  \(m.fromName) to \(m.toName)  \(m.delivered ? "" : "(unread)")")
                                     .font(.system(size: 11)).foregroundStyle(.secondary)
                                 Text(m.text).font(.system(size: 13)).textSelection(.enabled)
                                     .fixedSize(horizontal: false, vertical: true)

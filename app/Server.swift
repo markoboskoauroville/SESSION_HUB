@@ -164,6 +164,9 @@ final class Server {
             let (code, o) = core.send(from: json["from"] as? String ?? "", to: json["to"] as? String ?? "",
                                       text: json["text"] as? String ?? "", id: json["id"] as? String ?? "")
             respond(c, code, o)
+        case ("POST", "/ack"):
+            let seqs = (json["seqs"] as? [Any] ?? []).compactMap { ($0 as? NSNumber)?.intValue }
+            let (code, o) = core.ack(sid: json["sid"] as? String ?? "", seqs: seqs); respond(c, code, o)
         case ("GET", "/inbox"):
             let since = r.query["since"].flatMap { Int($0) }
             let (code, o) = core.inbox(sid: r.query["sid"] ?? "", since: since); respond(c, code, o)

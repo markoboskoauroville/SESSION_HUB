@@ -28,6 +28,7 @@ struct Msg: Codable, Identifiable {
     var ts: Double
     var delivered: Bool
     var via: String
+    var typed: Bool? = nil
     var id: Int { seq }
 }
 
@@ -46,7 +47,7 @@ func baseName(_ n: String) -> String {
 
 func msgDict(_ m: Msg) -> [String: Any] {
     return ["id": m.mid, "seq": m.seq, "from": m.from, "fromName": m.fromName, "to": m.to, "toName": m.toName,
-            "text": m.text, "ts": m.ts, "delivered": m.delivered, "via": m.via]
+            "text": m.text, "ts": m.ts, "delivered": m.delivered, "read": m.delivered, "via": m.via]
 }
 
 final class Core {
@@ -171,7 +172,7 @@ final class Core {
         lock.lock(); defer { lock.unlock() }
         let list: [[String: Any]] = sessions.values.sorted { $0.machine + $0.name < $1.machine + $1.name }.map { s in
             ["name": s.name, "sid": s.sid, "machine": s.machine, "kind": s.kind, "cwd": s.cwd,
-             "live": isLive(s), "lastBeat": s.lastBeat, "lastMsgAt": s.lastMsgAt, "lastMsg": s.lastMsgText]
+             "live": isLive(s), "watching": watchers[s.sid]?.count ?? 0, "lastBeat": s.lastBeat, "lastMsgAt": s.lastMsgAt, "lastMsg": s.lastMsgText]
         }
         return ["sessions": list, "now": nowTs()]
     }
@@ -235,23 +236,28 @@ final class Core {
             seq += 1
             var m = Msg(mid: mid, seq: seq, from: fromSid, fromName: fromName, to: tg.sid, toName: tg.name,
                         text: text, ts: ts, delivered: false, via: "")
+            // delivered = read (inbox fetched or watch acked). Watch and typing only NOTIFY; the inbox keeps the message until read.
+            var notify = "none"
+            let wc = watchers[tg.sid]?.count ?? 0
             if tg.kind == "human" {
-                m.delivered = true; m.via = "window"
-            } else if let ws = watchers[tg.sid], !ws.isEmpty {
-                let line = "data: " + String(data: (try? JSONSerialization.data(withJSONObject: msgDict(m))) ?? Data(), encoding: .utf8)! + "\n\n"
+                m.delivered = true; m.via = "window"; notify = "window"
+            } else if wc > 0, let ws = watchers[tg.sid] {
+                let line = "data: " + String(decoding: (try? JSONSerialization.data(withJSONObject: msgDict(m))) ?? Data(), as: UTF8.self) + "\n\n"
                 for w in ws { w.send(Data(line.utf8)) }
-                m.delivered = true; m.via = "watch"
+                m.via = "watch"; notify = "watch"
             } else if tg.kind == "mac-cli" && tg.machine == localMachine {
-                m.delivered = true; m.via = "typed"
+                m.via = "typing"; notify = "typing"
                 typeJobs.append((m.seq, tg.sid, fromName, text))
             }
+            log(["type": "decision", "seq": m.seq, "toSid": tg.sid, "toKind": tg.kind, "toMachine": tg.machine,
+                 "localMachine": localMachine, "watchers": wc, "notify": notify])
             msgs.append(m)
             if msgs.count > 2000 { msgs.removeFirst(msgs.count - 2000) }
             if var ts2 = sessions[tg.sid] { ts2.lastMsgAt = ts; ts2.lastMsgText = fromName + ": " + String(text.prefix(120)); sessions[tg.sid] = ts2 }
             if var fs2 = sessions[fromSid] { fs2.lastMsgAt = ts; fs2.lastMsgText = "to " + tg.name + ": " + String(text.prefix(120)); sessions[fromSid] = fs2 }
             log(["type": "msg", "id": mid, "seq": m.seq, "from": fromName, "fromSid": fromSid, "to": tg.name, "toSid": tg.sid,
                  "text": text, "delivered": m.delivered, "via": m.via])
-            out.append(["to": tg.name, "sid": tg.sid, "status": m.delivered ? "delivered" : "queued", "via": m.via, "id": mid, "seq": m.seq])
+            out.append(["to": tg.name, "sid": tg.sid, "status": m.delivered ? "delivered" : "queued", "notify": notify, "id": mid, "seq": m.seq])
         }
         save()
         lock.unlock()
@@ -270,15 +276,31 @@ final class Core {
             p.arguments = ["python3", self.otherSessions, "type", sid, line]
             p.standardOutput = Pipe(); p.standardError = Pipe()
             var ok = false
-            do { try p.run(); p.waitUntilExit(); ok = p.terminationStatus == 0 } catch { ok = false }
-            if !ok {
-                self.lock.lock()
-                if let i = self.msgs.firstIndex(where: { $0.seq == sq }) { self.msgs[i].delivered = false; self.msgs[i].via = "" }
-                self.save()
-                self.lock.unlock()
-                self.changed()
-            }
+            var out = ""
+            do {
+                try p.run(); p.waitUntilExit(); ok = p.terminationStatus == 0
+                if let pp = p.standardOutput as? Pipe { out = String(decoding: pp.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self) }
+            } catch { out = "\(error)" }
+            self.lock.lock()
+            if let i = self.msgs.firstIndex(where: { $0.seq == sq }) { self.msgs[i].typed = ok; self.msgs[i].via = ok ? "typed" : "typing-failed" }
+            self.log(["type": "typing", "seq": sq, "toSid": sid, "ok": ok, "out": String(out.prefix(80))])
+            self.save()
+            self.lock.unlock()
+            self.changed()
         }
+    }
+
+    func ack(sid: String, seqs: [Int]) -> (Int, [String: Any]) {
+        lock.lock()
+        var n = 0
+        for i in msgs.indices where msgs[i].to == sid && seqs.contains(msgs[i].seq) && !msgs[i].delivered {
+            msgs[i].delivered = true; n += 1
+        }
+        log(["type": "ack", "sid": sid, "seqs": seqs, "marked": n])
+        save()
+        lock.unlock()
+        changed()
+        return (200, ["ok": true, "marked": n])
     }
 
     func inbox(sid: String, since: Int?) -> (Int, [String: Any]) {
@@ -288,7 +310,7 @@ final class Core {
         for i in msgs.indices where msgs[i].to == sid {
             if let s = since { if msgs[i].seq <= s { continue } } else if msgs[i].delivered { continue }
             out.append(msgDict(msgs[i]))
-            if !msgs[i].delivered { msgs[i].delivered = true; msgs[i].via = "inbox" }
+            if !msgs[i].delivered { msgs[i].delivered = true; msgs[i].via = "inbox" }  // fetched = read
         }
         if var s = sessions[sid] { s.lastBeat = nowTs(); sessions[sid] = s }
         save()
@@ -307,9 +329,8 @@ final class Core {
             if let d = try? JSONSerialization.data(withJSONObject: msgDict(msgs[i])) {
                 watcher.send(Data(("data: " + String(decoding: d, as: UTF8.self) + "\n\n").utf8))
             }
-            msgs[i].delivered = true; msgs[i].via = "watch"
         }
-        save()
+        log(["type": "watch-open", "sid": sid, "count": watchers[sid]?.count ?? 0])
         lock.unlock()
         changed()
         return true
@@ -319,6 +340,7 @@ final class Core {
         lock.lock()
         watchers[sid]?.removeAll { $0.uid == watcher.uid }
         if watchers[sid]?.isEmpty == true { watchers[sid] = nil }
+        log(["type": "watch-close", "sid": sid, "left": watchers[sid]?.count ?? 0])
         if var s = sessions[sid] { s.lastBeat = nowTs(); sessions[sid] = s }
         lock.unlock()
         changed()

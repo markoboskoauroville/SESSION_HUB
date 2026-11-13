@@ -75,7 +75,20 @@ def open_req(base, method, path, body, timeout):
     return s
 
 
-def call(method, path, body=None, timeout=10):
+def call(method, path, body=None, timeout=10, tries=5):
+    """Retries with backoff (1, 2, 4, 8 s) when the hub cannot be reached (a SIM drop, Tailscale hiccup)."""
+    last = None
+    for attempt in range(tries):
+        if attempt:
+            time.sleep(min(2 ** (attempt - 1), 8))
+        r = call_once(method, path, body, timeout)
+        if isinstance(r, tuple):
+            return r
+        last = r
+    sys.exit("hub: cannot reach Session Hub after %d tries (%s). Is the app running and Tailscale up?" % (tries, last))
+
+
+def call_once(method, path, body, timeout):
     last = None
     for b in bases():
         try:
@@ -95,7 +108,7 @@ def call(method, path, body=None, timeout=10):
                 return code, {"raw": rest.decode("utf-8", "replace")}
         except Exception as e:
             last = e
-    sys.exit("hub: cannot reach Session Hub (%s). Is the app running and Tailscale up?" % last)
+    return last
 
 
 def tailscale_host():
@@ -199,7 +212,7 @@ def main():
         if code != 200:
             sys.exit("hub: %s" % j.get("error", j))
         for r in j["results"]:
-            print("%s: %s" % (r["to"], r["status"]))
+            print("%s: %s%s" % (r["to"], r["status"], (", notified by " + r["notify"]) if r.get("notify") not in (None, "none") else ""))
     elif cmd == "inbox":
         i = me()
         qs = "/inbox?sid=%s" % quote(i["sid"])
@@ -209,7 +222,7 @@ def main():
         if code == 404:
             register(i); code, j = call("GET", qs)
         for m in j.get("messages", []):
-            print(fmt(m))
+            print(fmt(m))   # fetching the inbox marks these read
     elif cmd == "beat":
         code, j = call("POST", "/beat", {"sid": me()["sid"]})
         print(j)
@@ -219,9 +232,24 @@ def main():
         sys.exit("unknown command; hub help")
 
 
+def ack(i, seqs):
+    try:
+        call("POST", "/ack", {"sid": i["sid"], "seqs": seqs}, tries=2)
+    except SystemExit:
+        pass
+
+
 def watch(i):
-    register(i)
+    """Stream of new messages. Each line is printed first, then acked (the inbox keeps it until then).
+    A stream silent for 70 s (the hub pings every 20 s) is dead: reconnect. Backoff 3 s up to 60 s."""
+    printed = set()
+    delay = 3
+    try:
+        register(i)
+    except SystemExit:
+        pass
     while True:
+        s = None
         try:
             for b in bases():
                 try:
@@ -231,7 +259,7 @@ def watch(i):
                     s = None
             if s is None:
                 raise OSError("hub unreachable")
-            s.settimeout(None)
+            s.settimeout(70)
             f = s.makefile("rb")
             line = f.readline()
             if b" 200" not in line:
@@ -241,19 +269,29 @@ def watch(i):
             got = False
             for raw in f:
                 got = True
+                delay = 3
                 raw = raw.decode("utf-8", "replace").strip()
                 if raw.startswith("data:"):
                     try:
-                        print(fmt(json.loads(raw[5:])), flush=True)
+                        m = json.loads(raw[5:])
                     except Exception:
-                        pass
+                        continue
+                    if m.get("seq") not in printed:
+                        printed.add(m.get("seq"))
+                        print(fmt(m), flush=True)
+                    ack(i, [m.get("seq")])
             if not got:
                 register(i)
         except SystemExit:
             pass
         except Exception:
             pass
-        time.sleep(3)
+        try:
+            s and s.close()
+        except Exception:
+            pass
+        time.sleep(delay)
+        delay = min(delay * 2, 60)
         try:
             register(i)
         except SystemExit:
