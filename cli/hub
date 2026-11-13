@@ -180,6 +180,33 @@ def register(me_):
     return j
 
 
+def cursor_file(sid):
+    return os.path.join(STATE, "last-%s.json" % re.sub(r"[^A-Za-z0-9_-]", "_", sid))
+
+
+def seen_before(sid, m):
+    """The last seq printed per session and hub epoch is kept in ~/.hub: an old seq is never printed twice,
+    even after the Monitor is re-armed. A new epoch (the hub lost its state) starts again."""
+    try:
+        cur = json.load(open(cursor_file(sid)))
+    except Exception:
+        cur = {}
+    return m.get("seq", 0) <= cur.get(m.get("epoch", ""), 0)
+
+
+def remember(sid, m):
+    try:
+        os.makedirs(STATE, exist_ok=True)
+        try:
+            cur = json.load(open(cursor_file(sid)))
+        except Exception:
+            cur = {}
+        cur = {m.get("epoch", ""): max(m.get("seq", 0), cur.get(m.get("epoch", ""), 0))}
+        json.dump(cur, open(cursor_file(sid), "w"))
+    except Exception:
+        pass
+
+
 def fmt(m):
     t = time.strftime("%H:%M", time.localtime(m.get("ts", time.time())))
     return "[hub %s] %s: %s" % (t, m.get("fromName") or m.get("from"), m.get("text", "").replace("\n", " "))
@@ -222,7 +249,9 @@ def main():
         if code == 404:
             register(i); code, j = call("GET", qs)
         for m in j.get("messages", []):
-            print(fmt(m))   # fetching the inbox marks these read
+            if not seen_before(i["sid"], m):
+                print(fmt(m))   # fetching the inbox marks these read
+                remember(i["sid"], m)
     elif cmd == "beat":
         code, j = call("POST", "/beat", {"sid": me()["sid"]})
         print(j)
@@ -276,9 +305,10 @@ def watch(i):
                         m = json.loads(raw[5:])
                     except Exception:
                         continue
-                    if m.get("seq") not in printed:
+                    if m.get("seq") not in printed and not seen_before(i["sid"], m):
                         printed.add(m.get("seq"))
                         print(fmt(m), flush=True)
+                        remember(i["sid"], m)
                     ack(i, [m.get("seq")])
             if not got:
                 register(i)

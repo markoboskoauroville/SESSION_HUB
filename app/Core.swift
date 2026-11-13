@@ -38,6 +38,8 @@ final class Watcher {
     init(send: @escaping (Data) -> Void) { self.send = send }
 }
 
+var hubEpoch = ""
+
 func nowTs() -> Double { Date().timeIntervalSince1970 }
 
 func baseName(_ n: String) -> String {
@@ -47,7 +49,7 @@ func baseName(_ n: String) -> String {
 
 func msgDict(_ m: Msg) -> [String: Any] {
     return ["id": m.mid, "seq": m.seq, "from": m.from, "fromName": m.fromName, "to": m.to, "toName": m.toName,
-            "text": m.text, "ts": m.ts, "delivered": m.delivered, "read": m.delivered, "via": m.via]
+            "text": m.text, "ts": m.ts, "delivered": m.delivered, "read": m.delivered, "via": m.via, "epoch": hubEpoch]
 }
 
 final class Core {
@@ -71,6 +73,7 @@ final class Core {
         dir = base.appendingPathComponent("Session Hub")
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         load()
+        if hubEpoch.isEmpty { hubEpoch = UUID().uuidString.lowercased() }
         ensureMarko()
     }
 
@@ -80,6 +83,7 @@ final class Core {
         var sessions: [Session]
         var msgs: [Msg]
         var seq: Int
+        var epoch: String? = nil
     }
 
     func load() {
@@ -88,11 +92,13 @@ final class Core {
         for s in st.sessions { sessions[s.sid] = s }
         msgs = st.msgs
         seq = st.seq
+        hubEpoch = st.epoch ?? ""
         for m in msgs { seen.insert(m.mid + "|" + m.to) }
     }
 
     func save() {
-        let st = State(sessions: Array(sessions.values), msgs: msgs, seq: seq)
+        if hubEpoch.isEmpty { hubEpoch = UUID().uuidString.lowercased() }
+        let st = State(sessions: Array(sessions.values), msgs: msgs, seq: seq, epoch: hubEpoch)
         if let d = try? JSONEncoder().encode(st) {
             try? d.write(to: dir.appendingPathComponent("state.json"), options: .atomic)
         }
